@@ -23,8 +23,8 @@ def _get_yolo_model():
 
 def find_cup(frame_bgr, confidence=0.25):
     """
-    Find a cup in the frame, ignoring other objects.
-    Prioritizes cups and filters out other detections.
+    Find a bottle in the frame, ignoring other objects.
+    Prioritizes bottles and filters out other detections.
     
     Args:
         frame_bgr: Input frame in BGR format
@@ -32,7 +32,7 @@ def find_cup(frame_bgr, confidence=0.25):
     
     Returns:
         tuple: (dict with 'cx', 'cy', 'bbox', 'label', 'confidence' keys, annotated frame) 
-               or (None, frame) if no cup found
+               or (None, frame) if no bottle found
     """
     model = _get_yolo_model()
     
@@ -61,8 +61,8 @@ def find_cup(frame_bgr, confidence=0.25):
     result = results[0]
     annotated_frame = result.plot()
     
-    # Find cup specifically
-    best_cup = None
+    # Find bottle specifically
+    best_bottle = None
     best_confidence = 0
     
     if result.boxes is not None and len(result.boxes) > 0:
@@ -73,15 +73,15 @@ def find_cup(frame_bgr, confidence=0.25):
             if cls_id < len(coco_classes):
                 detected_label = coco_classes[cls_id]
                 
-                # Only look for cups (and wine glasses as similar)
-                if detected_label == 'cup' or detected_label == 'wine glass':
+                # Only look for bottles
+                if detected_label == 'bottle':
                     if conf > best_confidence:
                         best_confidence = conf
                         # Get bounding box coordinates
                         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                         x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
                         cx, cy = x + w // 2, y + h // 2
-                        best_cup = {
+                        best_bottle = {
                             "cx": cx,
                             "cy": cy,
                             "bbox": (x, y, w, h),
@@ -89,7 +89,7 @@ def find_cup(frame_bgr, confidence=0.25):
                             "confidence": conf
                         }
     
-    return best_cup, annotated_frame
+    return best_bottle, annotated_frame
 
 
 def find_by_color(frame_bgr, color="black", min_area=500):

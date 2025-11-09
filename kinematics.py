@@ -20,6 +20,12 @@ DEFAULT_CALIBRATION = {
     "table_height_m": 0.40,    # Table height in meters (for reference)
     "arm_base_x": 0.0,         # Robot arm base X position in table coordinates
     "arm_base_y": 0.0,         # Robot arm base Y position in table coordinates
+    # Arm geometry (4-DOF)
+    "base_height_m": 0.0612,   # 61.2mm - from table to base
+    "shoulder_height_m": 0.095, # 95mm - from table to shoulder joint
+    "upper_arm_length_m": 0.12, # 12cm - shoulder to elbow
+    "lower_arm_length_m": 0.09, # 9cm - elbow to wrist
+    "hand_length_m": 0.06,     # 6cm - wrist to grabbing point (hand extends downward)
 }
 
 _calibration = None
@@ -130,75 +136,111 @@ def calculate_arm_angles(x, y, z=0.02, calibration=None):
     """
     Calculate robot arm joint angles for a given target position.
     
-    This is a simplified IK calculation for a typical 5-DOF arm:
-    - Base rotation (yaw)
-    - Shoulder pitch
-    - Elbow pitch
-    - Wrist pitch
-    - Gripper
+    This is IK calculation for a 4-DOF arm:
+    - Base rotation (yaw) - D5 (MG996R 180°)
+    - Shoulder pitch - D18 (MG996R 180°)
+    - Elbow pitch - D22 (MG996R 180°)
+    - Wrist pitch (x-axis rotation, up/down) - D19 (9g servo 180°)
+    - No gripper (hand is locked in position)
     
     Args:
-        x: X position in meters (right is positive)
-        y: Y position in meters (forward is positive)
-        z: Z position in meters (height above table, default: 0.02)
+        x: X position in meters (right is positive) - grabbing point position
+        y: Y position in meters (forward is positive) - grabbing point position
+        z: Z position in meters (height above table, default: 0.02) - grabbing point position
         calibration: Calibration dict (uses loaded calibration if None)
     
     Returns:
-        dict: Joint angles in degrees and servo microseconds
+        dict: Joint angles in degrees
+    
+    Note:
+        The input (x, y, z) is the desired grabbing point position.
+        Since the hand extends downward from the wrist joint, the IK calculates
+        the wrist position at (x, y, z + hand_length).
     """
     if calibration is None:
         calibration = load_calibration()
     
+    import math
+    
     # Get arm base position
     arm_base_x = calibration.get("arm_base_x", 0.0)
     arm_base_y = calibration.get("arm_base_y", 0.0)
+    
+    # Get arm geometry from calibration or use defaults
+    base_height = calibration.get("base_height_m", 0.0612)  # 61.2mm
+    shoulder_height = calibration.get("shoulder_height_m", 0.095)  # 95mm
+    upper_arm_length = calibration.get("upper_arm_length_m", 0.12)  # 12cm
+    lower_arm_length = calibration.get("lower_arm_length_m", 0.09)  # 9cm
+    hand_length = calibration.get("hand_length_m", 0.06)  # 6cm - hand extends downward
+    
+    # Adjust target position: hand extends downward from wrist
+    # If we want grabbing point at z, wrist needs to be at z + hand_length
+    wrist_z = z + hand_length
     
     # Calculate relative position from arm base
     rel_x = x - arm_base_x
     rel_y = y - arm_base_y
     
     # Calculate base rotation (yaw) - angle to target in XY plane
-    import math
     base_angle_deg = math.degrees(math.atan2(rel_y, rel_x))
     
-    # Calculate distance in XY plane
+    # Calculate distance in XY plane from base
     xy_dist = math.sqrt(rel_x**2 + rel_y**2)
     
-    # Simplified arm geometry (adjust these based on your arm)
-    # Assuming arm with shoulder height = 0.15m, upper arm = 0.20m, lower arm = 0.15m
-    shoulder_height = 0.15
-    upper_arm_length = 0.20
-    lower_arm_length = 0.15
+    # Calculate target distance from shoulder joint
+    # Shoulder is at height = base_height + shoulder_height
+    shoulder_z = base_height + shoulder_height
+    # Target is the wrist position (grabbing point + hand length upward)
+    target_z_relative = wrist_z - shoulder_z  # Height relative to shoulder
     
-    # Calculate target distance from shoulder
-    target_dist = math.sqrt(xy_dist**2 + (z - shoulder_height)**2)
+    # Calculate distance from shoulder to wrist in 3D
+    target_dist = math.sqrt(xy_dist**2 + target_z_relative**2)
     
     # Check if target is reachable
+    # Max reach includes upper arm + lower arm (hand length is already accounted in wrist_z)
     max_reach = upper_arm_length + lower_arm_length
     if target_dist > max_reach:
         print(f"Warning: Target at {target_dist:.3f}m exceeds max reach {max_reach:.3f}m")
+        # Scale down to max reach
+        scale = max_reach / target_dist
+        xy_dist *= scale
+        target_z_relative *= scale
         target_dist = max_reach
     
-    # Use law of cosines for 2-link arm
-    # cos(shoulder_angle) = (upper^2 + target^2 - lower^2) / (2 * upper * target)
-    cos_shoulder = (upper_arm_length**2 + target_dist**2 - lower_arm_length**2) / (2 * upper_arm_length * target_dist)
-    cos_shoulder = max(-1, min(1, cos_shoulder))  # Clamp to valid range
-    shoulder_angle_deg = math.degrees(math.acos(cos_shoulder))
+    # Calculate angle from shoulder to target in vertical plane
+    # Angle from horizontal (0 = horizontal forward, 90 = straight up)
+    target_angle_rad = math.atan2(target_z_relative, xy_dist)
+    target_angle_deg = math.degrees(target_angle_rad)
     
-    # Elbow angle
+    # Use law of cosines for 2-link arm (shoulder-elbow-wrist)
+    # Calculate elbow angle first
     cos_elbow = (upper_arm_length**2 + lower_arm_length**2 - target_dist**2) / (2 * upper_arm_length * lower_arm_length)
-    cos_elbow = max(-1, min(1, cos_elbow))
-    elbow_angle_deg = 180 - math.degrees(math.acos(cos_elbow))
+    cos_elbow = max(-1, min(1, cos_elbow))  # Clamp to valid range
+    elbow_angle_deg = math.degrees(math.acos(cos_elbow))
     
-    # Wrist angle to keep gripper level (simplified)
-    wrist_angle_deg = -(shoulder_angle_deg + elbow_angle_deg - 90)
+    # Calculate shoulder angle
+    # Use law of cosines to find angle between upper arm and target direction
+    # cos(angle_between) = (upper^2 + target^2 - lower^2) / (2 * upper * target)
+    cos_angle_between = (upper_arm_length**2 + target_dist**2 - lower_arm_length**2) / (2 * upper_arm_length * target_dist)
+    cos_angle_between = max(-1, min(1, cos_angle_between))
+    angle_between_deg = math.degrees(math.acos(cos_angle_between))
+    
+    # Shoulder angle = target angle - angle between upper arm and target
+    # This gives us the angle the upper arm makes with horizontal
+    shoulder_angle_deg = target_angle_deg - angle_between_deg
+    
+    # Wrist angle (x-axis rotation, up/down)
+    # Keep wrist perpendicular to ground for grabbing
+    # Wrist compensates for shoulder + elbow to keep hand level
+    # Total arm angle = shoulder + elbow, wrist keeps hand vertical
+    total_arm_angle = shoulder_angle_deg + elbow_angle_deg
+    wrist_angle_deg = 90 - total_arm_angle
     
     return {
         "base_deg": base_angle_deg,
         "shoulder_deg": shoulder_angle_deg,
         "elbow_deg": elbow_angle_deg,
         "wrist_deg": wrist_angle_deg,
-        "gripper_deg": 0,  # Open/close handled separately
     }
 
 
@@ -206,8 +248,12 @@ def fake_ik_to_us(x, y, z=0.02, calibration=None):
     """
     Convert table coordinates to servo microsecond values.
     
-    This maps joint angles to servo positions. Adjust the mapping
-    based on your specific servo configuration.
+    This maps joint angles to servo positions for 4-DOF arm:
+    - Base (D5): MG996R 180°
+    - Shoulder (D18): MG996R 180°
+    - Elbow (D22): MG996R 180°
+    - Wrist (D19): 9g servo 180° (x-axis rotation, up/down)
+    - No gripper (hand is locked)
     
     Args:
         x: X position in meters (right is positive)
@@ -216,23 +262,23 @@ def fake_ik_to_us(x, y, z=0.02, calibration=None):
         calibration: Calibration dict (uses loaded calibration if None)
     
     Returns:
-        list: [base_us, shoulder_us, elbow_us, wrist_us, grip_us]
+        list: [base_us, shoulder_us, elbow_us, wrist_us]
               Servo microsecond values (clamped to 900-2100 range)
     """
     angles = calculate_arm_angles(x, y, z, calibration)
     
     # Map angles to servo microseconds
-    # Adjust these ranges based on your servo configuration
-    # Typical: 1500 = center, 900 = -90deg, 2100 = +90deg
+    # MG996R: 1500 = center, 900 = -90deg, 2100 = +90deg
+    # ±90deg = ±600us from center
+    # Formula: us = 1500 + (angle_deg / 90) * 600
     
-    base_us = 1500 + int(angles["base_deg"] * 10 / 9)  # ±90deg = ±1000us
-    shoulder_us = 1500 + int(angles["shoulder_deg"] * 10 / 9)
-    elbow_us = 1500 + int(angles["elbow_deg"] * 10 / 9)
-    wrist_us = 1500 + int(angles["wrist_deg"] * 10 / 9)
-    grip_us = 1800  # Will be set by grip state
+    base_us = 1500 + int(angles["base_deg"] * 600 / 90)
+    shoulder_us = 1500 + int(angles["shoulder_deg"] * 600 / 90)
+    elbow_us = 1500 + int(angles["elbow_deg"] * 600 / 90)
+    wrist_us = 1500 + int(angles["wrist_deg"] * 600 / 90)
     
     clamp = lambda u: max(900, min(2100, u))
-    return list(map(clamp, [base_us, shoulder_us, elbow_us, wrist_us, grip_us]))
+    return list(map(clamp, [base_us, shoulder_us, elbow_us, wrist_us]))
 
 
 def get_arm_orientation_info(x, y, z=0.02, calibration=None):
@@ -249,6 +295,7 @@ def get_arm_orientation_info(x, y, z=0.02, calibration=None):
         "position_m": {"x": x, "y": y, "z": z},
         "angles_deg": angles,
         "servo_us": servo_us,
-        "servo_names": ["base", "shoulder", "elbow", "wrist", "grip"]
+        "servo_names": ["base", "shoulder", "elbow", "wrist"],
+        "gpio_pins": {"base": 5, "shoulder": 18, "elbow": 22, "wrist": 19}
     }
 

@@ -2,4 +2,5 @@ opencv-python
 numpy
 pydantic
 ultralytics
+pyserial
 
